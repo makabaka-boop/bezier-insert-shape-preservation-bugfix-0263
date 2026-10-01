@@ -19,9 +19,11 @@ import { customElement, state } from 'lit/decorators.js';
 import {
   CONTROL_Y_MAX,
   CONTROL_Y_MIN,
+  ControlPair,
   MAX_KEYFRAMES,
   MIN_KEYFRAMES,
   ThresholdSolution,
+  absoluteYControls,
 } from './easing-core.js';
 import { CurveStore } from './curve-store.js';
 
@@ -119,6 +121,9 @@ export class EasingEditor extends LitElement {
       border: 1px solid #2a3040;
       border-radius: 4px;
       padding: 2px 4px;
+    }
+    input[type='number']:disabled {
+      opacity: 0.35;
     }
     button {
       background: #22314f;
@@ -225,11 +230,10 @@ export class EasingEditor extends LitElement {
       vMax = Math.max(vMax, kf.v);
     }
     for (let i = 0; i < spec.controls.length; i++) {
-      const a = spec.keyframes[i];
-      const b = spec.keyframes[i + 1];
-      const c = spec.controls[i];
-      vMin = Math.min(vMin, a.v + c.y1 * (b.v - a.v), a.v + c.y2 * (b.v - a.v));
-      vMax = Math.max(vMax, a.v + c.y1 * (b.v - a.v), a.v + c.y2 * (b.v - a.v));
+      const p1 = this.controlPoint(i, 1);
+      const p2 = this.controlPoint(i, 2);
+      vMin = Math.min(vMin, p1.v, p2.v);
+      vMax = Math.max(vMax, p1.v, p2.v);
     }
     for (const s of this.store.sample(200)) {
       vMin = Math.min(vMin, s.v);
@@ -269,6 +273,21 @@ export class EasingEditor extends LitElement {
     const v = this.view!;
     return v.vMin + ((v.top + v.height - y) / v.height) * (v.vMax - v.vMin);
   }
+
+  private controlPoint(
+    i: number,
+    which: 1 | 2,
+  ): { t: number; v: number; absoluteY: boolean } {
+    const spec = this.store.spec;
+    const a = spec.keyframes[i];
+    const b = spec.keyframes[i + 1];
+    const c = spec.controls[i];
+    const dt = b.t - a.t;
+    const [y1, y2] = absoluteYControls(c, a.v, b.v);
+    if (which === 1) {
+      return { t: a.t + c.x1 * dt, v: y1, absoluteY: c.yAbs1 !== undefined };
+    }
+    return { t: a.t + c.x2 * dt, v: y2, absoluteY: c.yAbs2 !== undefined };  }
 
   // ---- drawing ---------------------------------------------------------------
 
@@ -332,26 +351,23 @@ export class EasingEditor extends LitElement {
     for (let i = 0; i < spec.controls.length; i++) {
       const a = spec.keyframes[i];
       const b = spec.keyframes[i + 1];
-      const c = spec.controls[i];
-      const dt = b.t - a.t;
-      const dv = b.v - a.v;
-      const pts: Array<[number, number]> = [
-        [a.t + c.x1 * dt, a.v + c.y1 * dv],
-        [a.t + c.x2 * dt, a.v + c.y2 * dv],
+      const pts: Array<[number, number, boolean]> = [
+        [this.controlPoint(i, 1).t, this.controlPoint(i, 1).v, this.controlPoint(i, 1).absoluteY],
+        [this.controlPoint(i, 2).t, this.controlPoint(i, 2).v, this.controlPoint(i, 2).absoluteY],
       ];
       const anchors: Array<[number, number]> = [
         [a.t, a.v],
         [b.t, b.v],
       ];
       for (let k = 0; k < 2; k++) {
-        const [ct, cv] = pts[k];
+        const [ct, cv, absoluteY] = pts[k];
         const [at, av] = anchors[k];
         ctx.strokeStyle = '#7a5fb0';
         ctx.beginPath();
         ctx.moveTo(this.xOf(at), this.yOf(av));
         ctx.lineTo(this.xOf(ct), this.yOf(cv));
         ctx.stroke();
-        ctx.fillStyle = '#b08fe8';
+        ctx.fillStyle = absoluteY ? '#e88fb8' : '#b08fe8';
         ctx.beginPath();
         ctx.arc(this.xOf(ct), this.yOf(cv), 5, 0, Math.PI * 2);
         ctx.fill();
@@ -417,18 +433,11 @@ export class EasingEditor extends LitElement {
       }
     }
     for (let i = 0; i < spec.controls.length; i++) {
-      const a = spec.keyframes[i];
-      const b = spec.keyframes[i + 1];
-      const c = spec.controls[i];
-      const dt = b.t - a.t;
-      const dv = b.v - a.v;
-      const handles: Array<[number, number, 1 | 2]> = [
-        [a.t + c.x1 * dt, a.v + c.y1 * dv, 1],
-        [a.t + c.x2 * dt, a.v + c.y2 * dv, 2],
-      ];
-      for (const [ct, cv, which] of handles) {
-        if (Math.hypot(x - this.xOf(ct), y - this.yOf(cv)) <= 8) {
-          return { kind: 'cp', segment: i, which };
+      const handles = [this.controlPoint(i, 1), this.controlPoint(i, 2)];
+      for (let k = 0; k < handles.length; k++) {
+        const p = handles[k];
+        if (Math.hypot(x - this.xOf(p.t), y - this.yOf(p.v)) <= 8) {
+          return { kind: 'cp', segment: i, which: (k + 1) as 1 | 2 };
         }
       }
     }
@@ -468,19 +477,29 @@ export class EasingEditor extends LitElement {
       const a = spec.keyframes[i];
       const b = spec.keyframes[i + 1];
       const dt = b.t - a.t;
-      const dv = b.v - a.v;
       const cx = Math.min(1, Math.max(0, (this.timeAt(x) - a.t) / dt));
-      const cy =
-        dv === 0
-          ? 0
-          : Math.min(CONTROL_Y_MAX, Math.max(CONTROL_Y_MIN, (this.valueAt(y) - a.v) / dv));
       const c = { ...spec.controls[i] };
-      if (drag.which === 1) {
-        c.x1 = cx;
-        c.y1 = cy;
+      if (this.controlPoint(i, drag.which).absoluteY) {
+        if (drag.which === 1) {
+          c.x1 = cx;
+          c.yAbs1 = this.valueAt(y);
+        } else {
+          c.x2 = cx;
+          c.yAbs2 = this.valueAt(y);
+        }
       } else {
-        c.x2 = cx;
-        c.y2 = cy;
+        const dv = b.v - a.v;
+        const cy =
+          dv === 0
+            ? 0
+            : Math.min(CONTROL_Y_MAX, Math.max(CONTROL_Y_MIN, (this.valueAt(y) - a.v) / dv));
+        if (drag.which === 1) {
+          c.x1 = cx;
+          c.y1 = cy;
+        } else {
+          c.x2 = cx;
+          c.y2 = cy;
+        }
       }
       this.store.updateControl(i, c);
     } else if (drag.kind === 'cursor') {
@@ -502,8 +521,9 @@ export class EasingEditor extends LitElement {
     const t = Math.round(this.timeAt(x));
     if (t <= spec.keyframes[0].t || t >= spec.keyframes[spec.keyframes.length - 1].t) return;
     if (spec.keyframes.some((k) => k.t === t)) return;
-    // put the new keyframe on the curve so the shape is preserved
-    this.store.insertKeyframe({ t, v: this.store.evaluate(t) });
+    // the store subdivides the segment at t so the new keyframe lands on, and
+    // both halves of the curve keep, the exact old shape
+    this.store.insertKeyframe({ t });
   }
 
   private clampTime(t: number): number {
@@ -532,10 +552,14 @@ export class EasingEditor extends LitElement {
     this.store.updateKeyframe(index, { t: this.store.spec.keyframes[index].t, v });
   }
 
-  private setControl(segment: number, field: 'x1' | 'y1' | 'x2' | 'y2', e: Event): void {
+  private setControl(
+    segment: number,
+    field: 'x1' | 'y1' | 'x2' | 'y2' | 'yAbs1' | 'yAbs2',
+    e: Event,
+  ): void {
     const value = Number((e.target as HTMLInputElement).value);
     if (!Number.isFinite(value)) return;
-    const c = { ...this.store.spec.controls[segment], [field]: value };
+    const c: ControlPair = { ...this.store.spec.controls[segment], [field]: value };
     try {
       this.store.updateControl(segment, c);
     } catch {
@@ -558,7 +582,7 @@ export class EasingEditor extends LitElement {
     }
     if (gap < 2) return;
     const t = spec.keyframes[best].t + Math.floor(gap / 2);
-    this.store.insertKeyframe({ t, v: this.store.evaluate(t) });
+    this.store.insertKeyframe({ t });
   }
 
   private reset(): void {
@@ -659,15 +683,37 @@ export class EasingEditor extends LitElement {
             <button @click=${this.reset}>重置</button>
           </fieldset>
           <fieldset>
-            <legend>控制点 (x∈[0,1], y∈[${CONTROL_Y_MIN},${CONTROL_Y_MAX}])</legend>
+            <legend>控制点 (x∈[0,1]，y∈[${CONTROL_Y_MIN},${CONTROL_Y_MAX}]；ya 为绝对数值空间)</legend>
             ${spec.controls.map(
               (c, i) => html`
                 <div class="cp-row">
                   <span class="tag">段 ${i}</span>
-                  ${(['x1', 'y1', 'x2', 'y2'] as const).map(
+                  ${(['x1', 'x2'] as const).map(
                     (f) => html`
                       <label>${f}
                         <input type="number" step="0.01" .value=${c[f].toFixed(3)}
+                          @change=${(e: Event) => this.setControl(i, f, e)} />
+                      </label>
+                    `,
+                  )}
+                  ${(
+                    [
+                      ['yAbs1', 'ya1', this.controlPoint(i, 1).v],
+                      ['yAbs2', 'ya2', this.controlPoint(i, 2).v],
+                    ] as const
+                  ).map(
+                    ([field, label, value]) => html`
+                      <label title="绝对数值空间控制点（由保形切分产生）">${label}
+                        <input type="number" step="0.01" .value=${value.toFixed(3)}
+                          @change=${(e: Event) => this.setControl(i, field, e)} />
+                      </label>
+                    `,
+                  )}
+                  ${(['y1', 'y2'] as const).map(
+                    (f) => html`
+                      <label>${f}
+                        <input type="number" step="0.01" .value=${c[f].toFixed(3)}
+                          ?disabled=${this.controlPoint(i, f === 'y1' ? 1 : 2).absoluteY}
                           @change=${(e: Event) => this.setControl(i, f, e)} />
                       </label>
                     `,

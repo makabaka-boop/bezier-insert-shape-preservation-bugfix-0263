@@ -1,11 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import {
   cubic,
+  cubicAxis,
   cubicDerivative,
   derivativeRoots,
   EasingCurve,
   invertX,
+  solveCubicAxisSegment,
   solveUnitSegment,
+  splitCubicAxis,
   validateSpec,
 } from '../src/easing-core.js';
 
@@ -224,6 +227,133 @@ describe('constant segment => interval, not points', () => {
     expect(c.solveThreshold(5).intervals).toEqual([[0, 4]]);
     expect(c.solveThreshold(5).times).toEqual([]);
     expect(c.solveThreshold(6).times).toEqual([]);
+  });
+});
+
+describe('shape-preserving segment split （保形切分）', () => {
+  it('subdivision reproduces the original axis exactly on both pieces', () => {
+    const u = 0.388;
+    const { left, right } = splitCubicAxis(0, 1.6, 1, 1.1, u);
+    // shared junction point, in both position and parameter
+    expect(left[3]).toBeCloseTo(right[0], 12);
+    expect(left[3]).toBeCloseTo(cubicAxis(0, 1.6, 1, 1.1, u), 12);
+    // the two pieces reparameterized at the junction meet the original
+    expect(cubicAxis(...left, 1)).toBeCloseTo(cubicAxis(0, 1.6, 1, 1.1, u), 12);
+    expect(cubicAxis(...right, 0)).toBeCloseTo(cubicAxis(0, 1.6, 1, 1.1, u), 12);
+  });
+
+  it('keeps every evaluation unchanged after splitting an overshoot segment', () => {
+    const c = makeCurve([[0, 0], [6, 1]], [{ x1: 0.25, y1: 1.6, x2: 0.6, y2: 1 }]);
+    const { keyframe, controls } = c.splitSegment(0, 2);
+    const split = new EasingCurve({
+      keyframes: [
+        { t: 0, v: 0 },
+        keyframe,
+        { t: 6, v: 1 },
+      ],
+      controls,
+    });
+    expect(keyframe.v).toBeCloseTo(c.evaluate(2), 12);
+    for (let i = 0; i <= 600; i++) {
+      const t = (6 * i) / 600;
+      expect(split.evaluate(t)).toBeCloseTo(c.evaluate(t), 10);
+    }
+    // the overshoot peak must still exist
+    let max = -Infinity;
+    for (let i = 0; i <= 600; i++) max = Math.max(max, split.evaluate((6 * i) / 600));
+    expect(max).toBeGreaterThan(1);
+  });
+
+  it('keeps the triple threshold intersections after a split near an endpoint', () => {
+    const c = makeCurve([[0, 0], [10, 1]], [{ x1: 0.1, y1: 2, x2: 0.9, y2: -1 }]);
+    const { keyframe, controls } = c.splitSegment(0, 1);
+    const split = new EasingCurve({
+      keyframes: [{ t: 0, v: 0 }, keyframe, { t: 10, v: 1 }],
+      controls,
+    });
+    const before = c.solveThreshold(0.5);
+    const after = split.solveThreshold(0.5);
+    expect(after.times).toHaveLength(before.times.length);
+    for (let i = 0; i < before.times.length; i++) {
+      expect(after.times[i]).toBeCloseTo(before.times[i], 8);
+    }
+  });
+
+  it('uses absolute controls to retain an overshoot in a split piece whose ends are equal', () => {
+    // Original hump between equal endpoints can only be authored directly in
+    // absolute space (normalized y over a zero delta cannot leave the value).
+    const split = new EasingCurve({
+      keyframes: [
+        { t: 0, v: 0 },
+        { t: 2, v: 1 },
+        { t: 4, v: 0 },
+      ],
+      controls: [
+        { x1: 1 / 3, y1: 0, x2: 2 / 3, y2: 0, yAbs1: 1.2, yAbs2: 2.0 },
+        { x1: 1 / 3, y1: 0, x2: 2 / 3, y2: 0, yAbs1: 1.3, yAbs2: 0.4 },
+      ],
+    });
+    expect(split.evaluate(2)).toBeCloseTo(1, 12);
+    let max = -Infinity;
+    for (let i = 0; i <= 400; i++) max = Math.max(max, split.evaluate((4 * i) / 400));
+    expect(max).toBeGreaterThan(1.2);
+    // a threshold inside the hump is crossed on the way up and back down
+    const sol = split.solveThreshold(1.1);
+    expect(sol.times.length).toBeGreaterThanOrEqual(2);
+  });
+
+  it('splits a truly constant segment into two constant segments (interval)', () => {
+    const c = makeCurve([[0, 1], [4, 1]], []);
+    const { keyframe, controls } = c.splitSegment(0, 2);
+    const split = new EasingCurve({
+      keyframes: [{ t: 0, v: 1 }, keyframe, { t: 4, v: 1 }],
+      controls,
+    });
+    expect(keyframe.v).toBe(1);
+    const sol = split.solveThreshold(1);
+    expect(sol.intervals).toEqual([[0, 4]]);
+    expect(sol.times).toEqual([]);
+    expect(split.solveThreshold(0).times).toEqual([]);
+  });
+
+  it('a second split keeps the curve unchanged as well', () => {
+    const c = makeCurve([[0, 0], [6, 1], [14, 0.2]], [
+      { x1: 0.25, y1: 1.6, x2: 0.6, y2: 1 },
+      { x1: 0.4, y1: 0, x2: 0.7, y2: -0.8 },
+    ]);
+    const s1 = c.splitSegment(0, 2);
+    const once = new EasingCurve({
+      keyframes: [{ t: 0, v: 0 }, s1.keyframe, { t: 6, v: 1 }, { t: 14, v: 0.2 }],
+      controls: [s1.controls[0], s1.controls[1], c.controls[1]],
+    });
+    const s2 = once.splitSegment(2, 10); // inside the second original segment
+    const twice = new EasingCurve({
+      keyframes: [
+        { t: 0, v: 0 },
+        s1.keyframe,
+        { t: 6, v: 1 },
+        s2.keyframe,
+        { t: 14, v: 0.2 },
+      ],
+      controls: [s1.controls[0], s1.controls[1], s2.controls[0], s2.controls[1]],
+    });
+    for (let i = 0; i <= 1400; i++) {
+      const t = (14 * i) / 1400;
+      expect(twice.evaluate(t)).toBeCloseTo(c.evaluate(t), 10);
+    }
+  });
+
+  it('rejects split times outside the segment', () => {
+    const c = makeCurve([[0, 0], [4, 1]]);
+    expect(() => c.splitSegment(0, 0)).toThrow();
+    expect(() => c.splitSegment(0, 4)).toThrow();
+    expect(() => c.splitSegment(0, 2.5)).toThrow();
+  });
+
+  it('general axis solver finds crossings of a non-normalized cubic', () => {
+    const roots = solveCubicAxisSegment(0, 0.62, 1.22, 1, 1.03);
+    expect(roots.length).toBeGreaterThanOrEqual(2);
+    for (const u of roots) expect(cubicAxis(0, 0.62, 1.22, 1, u)).toBeCloseTo(1.03, 9);
   });
 });
 

@@ -80,16 +80,36 @@ export class CurveStore {
     this.update({ keyframes: spec.keyframes.map((k) => ({ ...k })), controls });
   }
 
-  insertKeyframe(kf: { t: number; v: number }): void {
+  /**
+   * Insert a keyframe at an integer time strictly between two existing ones.
+   * The segment is split with de Casteljau subdivision, so the new keyframe
+   * lands on the curve and the geometric shape is preserved exactly; the value
+   * is computed from the curve, never supplied by the caller.
+   */
+  insertKeyframe(kf: { t: number }): void {
     const spec = this.curve.spec;
-    const keyframes = [...spec.keyframes.map((k) => ({ ...k })), { ...kf }].sort(
-      (a, b) => a.t - b.t,
-    );
-    const at = keyframes.findIndex((k) => k.t === kf.t);
-    const controls = spec.controls.map((c) => ({ ...c }));
-    // the segment that used to span `at` is split in two; both halves get
-    // identity controls so the new segments stay editable straight away
-    controls.splice(at, 0, identityControl());
+    let segment = -1;
+    for (let i = 0; i < spec.keyframes.length - 1; i++) {
+      if (kf.t > spec.keyframes[i].t && kf.t < spec.keyframes[i + 1].t) {
+        segment = i;
+        break;
+      }
+    }
+    if (segment < 0) {
+      throw new Error(`insertion time ${kf.t} must lie strictly between existing keyframes`);
+    }
+    const split = this.curve.splitSegment(segment, kf.t);
+    const keyframes = [
+      ...spec.keyframes.slice(0, segment + 1).map((k) => ({ ...k })),
+      { ...split.keyframe },
+      ...spec.keyframes.slice(segment + 1).map((k) => ({ ...k })),
+    ];
+    const controls = [
+      ...spec.controls.slice(0, segment).map((c) => ({ ...c })),
+      { ...split.controls[0] },
+      { ...split.controls[1] },
+      ...spec.controls.slice(segment + 1).map((c) => ({ ...c })),
+    ];
     this.update({ keyframes, controls });
   }
 
@@ -109,9 +129,4 @@ export class CurveStore {
   private emit(): void {
     for (const listener of this.listeners) listener();
   }
-}
-
-/** (1/3, 1/3) / (2/3, 2/3) makes both x(u) = u and y(u) = u: a linear segment. */
-export function identityControl(): { x1: number; y1: number; x2: number; y2: number } {
-  return { x1: 1 / 3, y1: 1 / 3, x2: 2 / 3, y2: 2 / 3 };
 }

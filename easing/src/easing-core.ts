@@ -11,10 +11,16 @@
  *   t(u) = t0 + x(u) * (t1 - t0)
  *   v(u) = v0 + y(u) * (v1 - v0)
  *
+ * Segments produced by shape-preserving subdivision (see splitSegment) carry
+ * optional absolute control coordinates yAbs1/yAbs2 which replace the
+ * normalized cy values: that representation is required once a split lands at
+ * an endpoint value, where the normalized form (multiplied by v1-v0 = 0) can
+ * no longer express the inherited overshoot.
+ *
  * Evaluation at time t inverts the monotone x(u) first, then evaluates y.
  * Threshold solving splits each segment at the extrema of y'(u) so every piece
- * is monotone, then finds every crossing or tangency. A segment whose endpoint
- * values are equal is constant over its whole time range; if that constant
+ * is monotone, then finds every crossing or tangency. A segment whose four y
+ * points are identical is constant over its whole time range; if that constant
  * equals the threshold the solution is a time *interval*, not points.
  */
 
@@ -44,6 +50,14 @@ export interface ControlPair {
   y1: number;
   x2: number;
   y2: number;
+  /**
+   * Optional absolute value-space y coordinates of the two controls. When
+   * present they override the normalized y1/y2 values; subdividing a segment
+   * at a keyframe whose value equals an endpoint needs this representation,
+   * because normalized controls cannot describe an overshoot in that case.
+   */
+  yAbs1?: number;
+  yAbs2?: number;
 }
 
 export interface CurveSpec {
@@ -96,7 +110,54 @@ export function validateSpec(spec: CurveSpec): void {
         throw new Error(`control ${name} of segment ${i} must be in [${lo}, ${hi}], got ${value}`);
       }
     }
+    if (c.yAbs1 !== undefined && !Number.isFinite(c.yAbs1)) {
+      throw new Error(`control yAbs1 of segment ${i} must be finite, got ${c.yAbs1}`);
+    }
+    if (c.yAbs2 !== undefined && !Number.isFinite(c.yAbs2)) {
+      throw new Error(`control yAbs2 of segment ${i} must be finite, got ${c.yAbs2}`);
+    }
   }
+}
+
+/** Absolute y coordinates of a segment's two control points. */
+export function absoluteYControls(
+  control: ControlPair,
+  v0: number,
+  v1: number,
+): [number, number] {
+  const dv = v1 - v0;
+  return [
+    control.yAbs1 ?? v0 + control.y1 * dv,
+    control.yAbs2 ?? v0 + control.y2 * dv,
+  ];
+}
+
+/**
+ * Split a bezier axis at u with de Casteljau subdivision. A cubic split at
+ * the point on the original curve produces exactly two cubic pieces, so the
+ * geometric curve is unchanged.
+ */
+export function splitCubicAxis(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+  u: number,
+): {
+  left: [number, number, number, number];
+  right: [number, number, number, number];
+} {
+  const w = 1 - u;
+  const q01 = w * p0 + u * p1;
+  const q12 = w * p1 + u * p2;
+  const q23 = w * p2 + u * p3;
+  const r02 = w * q01 + u * q12;
+  const r13 = w * q12 + u * q23;
+  const s = w * r02 + u * r13;
+  return {
+    left: [p0, q01, r02, s],
+    right: [s, r13, q23, p3],
+  };
 }
 
 /** Normalized cubic bezier with endpoints 0 and 1: B(u) for control values c1, c2. */
@@ -111,16 +172,36 @@ export function cubicDerivative(c1: number, c2: number, u: number): number {
   return 3 * w * w * c1 + 6 * w * u * (c2 - c1) + 3 * u * u * (1 - c2);
 }
 
+/** Value of a general cubic bezier axis at u. */
+export function cubicAxis(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+  u: number,
+): number {
+  const w = 1 - u;
+  return (
+    w * w * w * p0 +
+    3 * w * w * u * p1 +
+    3 * w * u * u * p2 +
+    u * u * u * p3
+  );
+}
+
 /**
- * Interior extrema of the normalized bezier: u in (0,1) where B'(u) = 0.
- * B' is quadratic: a u^2 + b u + c with
- *   a = 3(c1 - c2) + 1, b = 2(c2 - 2c1), c = c1.
- * Returns 0, 1 or 2 sorted distinct values.
+ * Interior extrema of a cubic bezier axis: u in (0,1) where B'(u) = 0.
+ * B' is quadratic. Returns 0, 1 or 2 sorted distinct values.
  */
-export function derivativeRoots(c1: number, c2: number): number[] {
-  const a = 3 * (c1 - c2) + 1;
-  const b = 2 * (c2 - 2 * c1);
-  const c = c1;
+export function cubicDerivativeRoots(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+): number[] {
+  const a = 3 * (p3 - 3 * p2 + 3 * p1 - p0);
+  const b = 6 * (p2 - 2 * p1 + p0);
+  const c = 3 * (p1 - p0);
   const roots: number[] = [];
   if (Math.abs(a) < PARAM_EPS) {
     if (Math.abs(b) > PARAM_EPS) roots.push(-c / b);
@@ -136,6 +217,11 @@ export function derivativeRoots(c1: number, c2: number): number[] {
     .sort((p, q) => p - q);
   // dedupe (double root)
   return interior.filter((u, i) => i === 0 || u - interior[i - 1] > PARAM_EPS);
+}
+
+/** Interior extrema of the normalized bezier: u in (0,1) where B'(u) = 0. */
+export function derivativeRoots(c1: number, c2: number): number[] {
+  return cubicDerivativeRoots(0, c1, c2, 1);
 }
 
 /** Bisection on a monotone function; 80 iterations => ~1e-24 interval width. */
@@ -167,13 +253,21 @@ export function invertX(cx1: number, cx2: number, x: number): number {
 }
 
 /**
- * All u in [0,1] where cubic(cy1, cy2, u) = yHat, found by splitting the unit
- * segment at the extrema of y'(u) into monotone pieces. Crossings and tangent
- * touches are both reported; duplicates at shared split points are merged.
+ * All u in [0,1] where the cubic bezier axis equals target. The axis is split
+ * at derivative extrema into monotone pieces; crossings and tangent touches
+ * are both reported, and duplicates at shared split points are merged.
+ * A constant axis returns no roots; the caller is responsible for intervals.
  */
-export function solveUnitSegment(cy1: number, cy2: number, yHat: number): number[] {
-  const f = (u: number) => cubic(cy1, cy2, u) - yHat;
-  const bounds = [0, ...derivativeRoots(cy1, cy2), 1];
+export function solveCubicAxisSegment(
+  p0: number,
+  p1: number,
+  p2: number,
+  p3: number,
+  target: number,
+): number[] {
+  if (p0 === p1 && p1 === p2 && p2 === p3) return [];
+  const f = (u: number) => cubicAxis(p0, p1, p2, p3, u) - target;
+  const bounds = [0, ...cubicDerivativeRoots(p0, p1, p2, p3), 1];
   const roots: number[] = [];
   for (let i = 0; i < bounds.length - 1; i++) {
     const lo = bounds[i];
@@ -194,6 +288,15 @@ export function solveUnitSegment(cy1: number, cy2: number, yHat: number): number
   if (Math.abs(f(1)) <= ZERO_EPS) roots.push(1);
   roots.sort((p, q) => p - q);
   return roots.filter((u, i) => i === 0 || u - roots[i - 1] > DEDUP_TOL);
+}
+
+/**
+ * All u in [0,1] where cubic(cy1, cy2, u) = yHat, found by splitting the unit
+ * segment at the extrema of y'(u) into monotone pieces. Crossings and tangent
+ * touches are both reported; duplicates at shared split points are merged.
+ */
+export function solveUnitSegment(cy1: number, cy2: number, yHat: number): number[] {
+  return solveCubicAxisSegment(0, cy1, cy2, 1, yHat);
 }
 
 export class EasingCurve {
@@ -238,6 +341,61 @@ export class EasingCurve {
     return lo;
   }
 
+  /** Absolute y controls for a segment, resolving normalized controls. */
+  private yControls(i: number): [number, number] {
+    return absoluteYControls(
+      this.spec.controls[i],
+      this.spec.keyframes[i].v,
+      this.spec.keyframes[i + 1].v,
+    );
+  }
+
+  /**
+   * Subdivide segment i at a new keyframe time. The split is done in parameter
+   * space (de Casteljau) at the u that maps to the requested time, which keeps
+   * both halves on exactly the old cubic curve.
+   */
+  splitSegment(segment: number, t: number): {
+    keyframe: Keyframe;
+    controls: [ControlPair, ControlPair];
+  } {
+    const kfs = this.spec.keyframes;
+    const a = kfs[segment];
+    const b = kfs[segment + 1];
+    if (!Number.isInteger(t) || t <= a.t || t >= b.t) {
+      throw new Error(`split time must be an integer strictly between ${a.t} and ${b.t}, got ${t}`);
+    }
+    const c = this.spec.controls[segment];
+    const s = (t - a.t) / (b.t - a.t);
+    const u = invertX(c.x1, c.x2, s);
+    const xSplit = splitCubicAxis(0, c.x1, c.x2, 1, u);
+    const [ay1, ay2] = this.yControls(segment);
+    const ySplit = splitCubicAxis(a.v, ay1, ay2, b.v, u);
+    const v = ySplit.left[3];
+
+    // X controls are normalized within each new segment. Clamp subdivision
+    // round-off so validation accepts exact endpoints.
+    const norm = (value: number) => Math.min(1, Math.max(0, value));
+    const left: ControlPair = {
+      x1: norm(xSplit.left[1] / s),
+      x2: norm(xSplit.left[2] / s),
+      y1: 1 / 3,
+      y2: 2 / 3,
+      yAbs1: ySplit.left[1],
+      yAbs2: ySplit.left[2],
+    };
+    const r = 1 - s;
+    const right: ControlPair = {
+      x1: norm((xSplit.right[1] - s) / r),
+      x2: norm((xSplit.right[2] - s) / r),
+      y1: 1 / 3,
+      y2: 2 / 3,
+      yAbs1: ySplit.right[1],
+      yAbs2: ySplit.right[2],
+    };
+    return { keyframe: { t, v }, controls: [left, right] };
+  }
+
   /**
    * Value at time t: locate the segment, invert the monotone x(u) to get the
    * parameter u, then evaluate y(u) mapped to the endpoint values.
@@ -252,7 +410,8 @@ export class EasingCurve {
     const b = kfs[i + 1];
     const c = this.spec.controls[i];
     const u = invertX(c.x1, c.x2, (t - a.t) / (b.t - a.t));
-    return a.v + cubic(c.y1, c.y2, u) * (b.v - a.v);
+    const [y1, y2] = this.yControls(i);
+    return cubicAxis(a.v, y1, y2, b.v, u);
   }
 
   /**
@@ -267,9 +426,10 @@ export class EasingCurve {
     for (let i = 0; i < kfs.length - 1; i++) {
       const a = kfs[i];
       const b = kfs[i + 1];
-      const dv = b.v - a.v;
-      if (dv === 0) {
-        // value is constant v over the whole segment regardless of controls
+      const c = this.spec.controls[i];
+      const [y1, y2] = this.yControls(i);
+      if (a.v === b.v && a.v === y1 && y1 === y2) {
+        // the whole segment is constant, regardless of its normalized fields
         if (a.v === threshold) {
           const last = intervals[intervals.length - 1];
           if (last && last[1] === a.t) last[1] = b.t;
@@ -277,9 +437,7 @@ export class EasingCurve {
         }
         continue;
       }
-      const yHat = (threshold - a.v) / dv;
-      const c = this.spec.controls[i];
-      for (const u of solveUnitSegment(c.y1, c.y2, yHat)) {
+      for (const u of solveCubicAxisSegment(a.v, y1, y2, b.v, threshold)) {
         times.push(a.t + cubic(c.x1, c.x2, u) * (b.t - a.t));
       }
     }
